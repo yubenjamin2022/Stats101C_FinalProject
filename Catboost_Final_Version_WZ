@@ -1,0 +1,280 @@
+# ============================================================
+# Aluminum Cold Roll – CatBoost with Pseudo-Labeling Ensemble
+# ============================================================
+
+# --- 1. Setup ------------------------------------------------
+
+set.seed(123)
+
+library(tidyverse)
+library(pROC)
+library(catboost)
+library(lightgbm)  # currently unused, but kept in case you add LGBM
+library(caret)     # currently unused, but kept if you add caret utilities
+
+
+# --- 2. Load data --------------------------------------------
+
+train <- read.csv("/kaggle/input/f-2025-101-c-final-project-x/aluminum_coldRoll_train.csv")
+test  <- read.csv("/kaggle/input/f-2025-101-c-final-project-x/aluminum_coldRoll_testNoY.csv")
+
+str(train)
+
+
+# --- 3. Basic preprocessing (factors, design matrices) -------
+
+# Categorical variables
+cat_vars <- c(
+  "alloy",
+  "cutTemp",
+  "rollTemp",
+  "topEdgeMicroChipping",
+  "blockSource",
+  "machineRestart"
+)
+
+# Convert to factors in train & test
+for (v in cat_vars) {
+  if (v %in% names(train)) train[[v]] <- as.factor(train[[v]])
+  if (v %in% names(test))  test[[v]]  <- as.factor(test[[v]])
+}
+
+# Align levels between train & test
+for (v in cat_vars) {
+  if (v %in% names(train) && v %in% names(test)) {
+    test[[v]] <- factor(test[[v]], levels = levels(train[[v]]))
+  }
+}
+
+# Target as numeric 0/1
+y_train <- train$y_passXtremeDurability
+if (!is.numeric(y_train)) {
+  y_train <- as.numeric(as.character(y_train))
+}
+
+# Feature data frames (no ID, no target)
+X_train_df <- train %>%
+  dplyr::select(-ID, -y_passXtremeDurability)
+
+X_test_df <- test %>%
+  dplyr::select(-ID)
+
+# In case you have a separate feature-engineered version, plug it in here.
+# For now, we just set FE = original design matrices.
+X_train_fe <- X_train_df
+X_test_fe  <- X_test_df
+
+# Categorical feature indices for CatBoost (0-based)
+cat_feature_indices_fe <- which(names(X_train_fe) %in% cat_vars) - 1L
+
+cat("Categorical feature indices (0-based):\n")
+print(cat_feature_indices_fe)
+
+
+# --- 4. (Optional) simple train/validation split  ------------
+
+set.seed(123)
+n          <- nrow(X_train_df)
+train_size <- floor(0.8 * n)
+idx        <- sample(seq_len(n), size = train_size)
+
+# If you want a manual hold-out split, you can use:
+# X_tr <- X_train_df[idx, , drop = FALSE]
+# y_tr <- y_train[idx]
+# X_val <- X_train_df[-idx, , drop = FALSE]
+# y_val <- y_train[-idx]
+
+
+# --- 5. CV on original FE data + generate pseudo labels ------
+
+# Full pool on original labeled data
+full_pool_fe <- catboost.load_pool(
+  data         = X_train_fe,
+  label        = y_train,
+  cat_features = cat_feature_indices_fe
+)
+
+# CatBoost parameters (your tuned / greedy settings)
+final_params <- list(
+  loss_function     = "Logloss",
+  eval_metric       = "Logloss",
+  iterations        = 3500,
+  learning_rate     = 0.08,
+  depth             = 4,
+  border_count      = 32,
+  l2_leaf_reg       = 1.5,
+  min_data_in_leaf  = 1,
+  random_strength   = 0,
+  bootstrap_type    = "No",
+  random_seed       = 123,
+  od_type           = "Iter",
+  od_wait           = 100,
+  use_best_model    = TRUE
+)
+
+cat("Running 5-fold CV on original FE data...\n")
+
+cv_res_fe <- catboost.cv(
+  pool                  = full_pool_fe,
+  params                = final_params,
+  fold_count            = 5,
+  type                  = "Classical",
+  partition_random_seed = 123,
+  stratified            = TRUE
+)
+
+best_iter_fe  <- which.min(cv_res_fe$test.Logloss.mean)
+best_cv_ll_fe <- cv_res_fe$test.Logloss.mean[best_iter_fe]
+
+cat("\nOriginal FE 5-fold CV Logloss:", best_cv_ll_fe, "\n")
+cat("Best iteration (original FE):", best_iter_fe, "\n")
+
+# Retrain base model on ALL labeled data using best iteration
+base_params <- final_params
+base_params$iterations     <- best_iter_fe
+base_params$use_best_model <- FALSE
+base_params$od_type        <- NULL   # disable OD when training final model
+
+cat("\nTraining base CatBoost on full labeled data...\n")
+
+base_model_full <- catboost.train(
+  learn_pool = full_pool_fe,
+  params     = base_params
+)
+
+# Predict on test to get pseudo-label candidates
+test_pool_fe <- catboost.load_pool(
+  data         = X_test_fe,
+  cat_features = cat_feature_indices_fe
+)
+
+test_probs_base <- catboost.predict(
+  base_model_full,
+  test_pool_fe,
+  prediction_type = "Probability"
+)
+
+# Select confident pseudo-labels
+high_thr <- 0.98
+low_thr  <- 0.02
+
+pos_idx    <- which(test_probs_base >= high_thr)
+neg_idx    <- which(test_probs_base <= low_thr)
+pseudo_idx <- sort(unique(c(pos_idx, neg_idx)))
+
+cat("\nPseudo-label thresholds: [", low_thr, ",", high_thr, "]\n", sep = "")
+cat("Pseudo-labeled test rows:", length(pseudo_idx), "\n")
+
+# Create pseudo labels (0/1) from prob threshold 0.5
+pseudo_y <- ifelse(test_probs_base[pseudo_idx] >= 0.5, 1, 0)
+
+# Build augmented training set
+X_pseudo <- X_test_fe[pseudo_idx, , drop = FALSE]
+
+X_train_pseudo <- rbind(X_train_fe, X_pseudo)
+y_train_pseudo <- c(y_train, pseudo_y)
+
+cat("Original train rows:", nrow(X_train_fe), "\n")
+cat("Augmented train rows:", nrow(X_train_pseudo), "\n")
+
+
+# --- 6. 5-fold CV on pseudo-augmented data -------------------
+
+full_pool_pseudo <- catboost.load_pool(
+  data         = X_train_pseudo,
+  label        = y_train_pseudo,
+  cat_features = cat_feature_indices_fe
+)
+
+pseudo_params <- final_params
+pseudo_params$iterations     <- 3500
+pseudo_params$use_best_model <- TRUE
+pseudo_params$od_type        <- "Iter"
+pseudo_params$od_wait        <- 100
+
+cat("\nRunning 5-fold CV on pseudo-augmented data...\n")
+
+cv_res_pseudo <- catboost.cv(
+  pool                  = full_pool_pseudo,
+  params                = pseudo_params,
+  fold_count            = 5,
+  type                  = "Classical",
+  partition_random_seed = 123,
+  stratified            = TRUE
+)
+
+best_iter_pseudo  <- which.min(cv_res_pseudo$test.Logloss.mean)
+best_cv_ll_pseudo <- cv_res_pseudo$test.Logloss.mean[best_iter_pseudo]
+
+cat("\nPseudo-augmented 5-fold CV Logloss:", best_cv_ll_pseudo, "\n")
+cat("Best iteration (pseudo-augmented):", best_iter_pseudo, "\n")
+
+
+# --- 7. Seed-averaged pseudo-labeled CatBoost ensemble -------
+
+final_pseudo_params <- final_params
+final_pseudo_params$iterations     <- best_iter_pseudo
+final_pseudo_params$use_best_model <- FALSE
+final_pseudo_params$od_type        <- NULL   # no OD for final ensemble training
+
+full_pool_pseudo <- catboost.load_pool(
+  data         = X_train_pseudo,
+  label        = y_train_pseudo,
+  cat_features = cat_feature_indices_fe
+)
+
+# Choose a few seeds for the ensemble
+seeds <- c(123, 456, 789)
+
+cat_models_pseudo <- vector("list", length(seeds))
+
+for (i in seq_along(seeds)) {
+  cat("\nTraining pseudo-labeled ensemble model", i, "with seed", seeds[i], "...\n")
+  params_i <- final_pseudo_params
+  params_i$random_seed <- seeds[i]
+  
+  cat_models_pseudo[[i]] <- catboost.train(
+    learn_pool = full_pool_pseudo,
+    params     = params_i
+  )
+}
+
+# Predict on full test set with each model (ensemble)
+test_pool_fe <- catboost.load_pool(
+  data         = X_test_fe,
+  cat_features = cat_feature_indices_fe
+)
+
+test_pred_mat <- matrix(
+  NA_real_,
+  nrow = nrow(X_test_fe),
+  ncol = length(seeds)
+)
+
+for (i in seq_along(cat_models_pseudo)) {
+  test_pred_mat[, i] <- catboost.predict(
+    cat_models_pseudo[[i]],
+    test_pool_fe,
+    prediction_type = "Probability"
+  )
+}
+
+# Average ensemble predictions and clip for numerical safety
+eps <- 1e-6
+test_probs_pseudo_ens <- rowMeans(test_pred_mat)
+test_probs_pseudo_ens <- pmin(pmax(test_probs_pseudo_ens, eps), 1 - eps)
+
+# --- 8. Create submission file --------------------------------
+
+submission_pseudo_ens <- data.frame(
+  ID                    = test$ID,
+  y_passXtremeDurability = test_probs_pseudo_ens
+)
+
+write.csv(
+  submission_pseudo_ens,
+  "submission_catboost_pseudolabel_ens.csv",
+  row.names = FALSE
+)
+
+cat("\nSaved pseudo-labeled ensemble submission to 'submission_catboost_pseudolabel_ens.csv'\n")
